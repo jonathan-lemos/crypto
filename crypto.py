@@ -1,5 +1,6 @@
 import argparse
 import os
+import secrets
 import sys
 from enum import Enum
 from getpass import getpass
@@ -9,7 +10,6 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
@@ -123,7 +123,8 @@ parser = argparse.ArgumentParser(
     description="Encrypts or decrypts input. The $PASSPHRASE environment variable can be set to specify the password if you don't want to type it in.")
 parser.add_argument("action",
                     metavar="ACTION",
-                    help="'enc' to encrypt, 'dec' to decrypt, 'ciphers' to list ciphers")
+                    help="'enc' to encrypt, 'dec' to decrypt, 'ciphers' to list ciphers, 'hashes' to list hash functions, 'kdfs' to list kdfs.")
+
 parser.add_argument("-c", "--cipher",
                     dest="cipher",
                     metavar="CIPHER",
@@ -173,30 +174,46 @@ parser.add_argument("-v", "--verbose",
 
 options = parser.parse_args()
 
-actions = ["enc", "dec", "ciphers"]
+actions = ["enc", "dec", "ciphers", "hashes", "kdfs"]
 if options.action not in actions:
-    raise ValueError(f"Action must be one of {actions}. Was '{options.action}'.")
+    print(f"Action must be one of {actions}. Was '{options.action}'.", file=sys.stderr)
+    exit(1)
 
 if options.action == "ciphers":
     print("\n".join(ciphers))
     exit(0)
 
+if options.action == "hashes":
+    print("\n".join(hashtypes))
+    exit(0)
+
+if options.action == "kdfs":
+    print("\n".join(kdfs))
+    exit(0)
+
 try:
     cipher, key_len, mode = ciphers[options.cipher.upper()]
 except KeyError:
-    raise ValueError(f"Invalid cipher '{options.cipher}'. Must be one of: {', '.join(ciphers)}")
+    print(f"Invalid cipher '{options.cipher}'. Must be one of: {', '.join(ciphers)}", file=sys.stderr)
+    exit(1)
 
 try:
     kdf = kdfs[options.kdf.upper()]
 except KeyError:
-    raise ValueError(f"Invalid KDF '{options.kdf}'. Must be one of: {' '.join(kdfs)}")
+    print(f"Invalid KDF '{options.kdf}'. Must be one of: {' '.join(kdfs)}", file=sys.stderr)
+    exit(1)
 
 try:
     hashfunc = hashtypes[options.key_hash.upper()]
 except KeyError:
-    raise ValueError(f"Invalid hash function '{options.key_hash}'. Must be one of {' '.join(hashtypes)}.")
+    print(f"Invalid hash function '{options.key_hash}'. Must be one of {' '.join(hashtypes)}.", file=sys.stderr)
+    exit(1)
 
 __backend = default_backend()
+
+
+def rand_bytes(length: int) -> bytes:
+    return secrets.token_bytes(length)
 
 
 def make_key(salt: bytes) -> bytes:
@@ -212,17 +229,18 @@ def make_key(salt: bytes) -> bytes:
     )
 
     if options.verbose:
-        print(f"Making a {key_len}-bit key with {options.kdf} using {options.key_iterations} of {options.key_hash}.")
+        print(f"Making a {key_len}-bit key with {options.kdf} using {options.key_iterations} rounds of {options.key_hash}.")
 
     return df.derive(bytes(passphrase, "utf-8"))
 
 
 def encrypt():
     if (salt := options.salt) is None:
-        salt = os.urandom(16)
+        salt = rand_bytes(16)
     if (iv := options.initialization_vector) is None:
-        iv = os.urandom(cipher["block_size"])
+        iv = rand_bytes(cipher["block_size"])
     key = make_key(salt)
+    n_bytes = 0
 
     if options.input is None:
         stdin = sys.stdin.buffer
@@ -232,7 +250,7 @@ def encrypt():
     if options.output is None:
         stdout = sys.stdout.buffer
     else:
-        stdout = open(options.stdout, "wb")
+        stdout = open(options.output, "wb")
 
     encryptor = Cipher(
         cipher["algorithm"](key),
@@ -244,11 +262,39 @@ def encrypt():
     stdout.write(salt)
     if mode:
         stdout.write(iv)
+
+        if options.verbose:
+            n_bytes += 2 + len(salt) + len(iv)
+            print("Wrote salt length, salt, and iv to file.")
+            print(f"\r{n_bytes} bytes processed.", end="")
+
     while len(buf := stdin.read(65536)) != 0:
         stdout.write(encryptor.update(buf))
-    stdout.write(encryptor.finalize())
+
+        if options.verbose:
+            n_bytes += len(buf)
+            print(f"\r{n_bytes} bytes processed.", end="")
+
+    if not options.verbose:
+        stdout.write(encryptor.finalize())
+    else:
+        buf = encryptor.finalize()
+        stdout.write(buf)
+        n_bytes += len(buf)
+        print(f"\r{n_bytes} bytes processed.", end="")
+
     if mode["auth_tag"]:
-        stdout.write(encryptor.tag)
+        if not options.verbose:
+            stdout.write(encryptor.tag)
+        else:
+            buf = encryptor.tag
+            stdout.write(encryptor.tag)
+            n_bytes += len(buf)
+            print(f"\r{n_bytes} bytes processed.", end="")
+            print(f"\nWrote authentication tag of length {len(encryptor.tag)}.")
+    else:
+        if options.verbose:
+            print()
 
     if stdin != sys.stdin.buffer:
         stdin.close()
@@ -265,18 +311,27 @@ def decrypt():
     if options.output is None:
         stdout = sys.stdout.buffer
     else:
-        stdout = open(options.stdout, "wb")
+        stdout = open(options.output, "wb")
 
     salt_len = int.from_bytes(stdin.read(2), byteorder="little")
     salt = stdin.read(salt_len)
     if len(salt) != salt_len:
-        raise ValueError(
-            f"Expected a salt of length {salt_len} but the file is not long enough. Most likely the file is corrupted or not encrypted using this cipher.")
+        print(
+            f"Expected a salt of length {salt_len} but the file is not long enough. Most likely the file is corrupted or not encrypted using this cipher.", file=sys.stderr)
+        exit(1)
+
+    n_bytes = 0
+    if options.verbose:
+        n_bytes += 2 + len(salt)
+        print(f"Read a salt of length {salt_len}.")
 
     key = make_key(salt)
 
     if mode:
         iv = stdin.read(cipher["block_size"])
+        if options.verbose:
+            n_bytes += len(iv)
+            print(f"Read an iv of length {len(iv)}.")
     else:
         iv = None
 
@@ -290,10 +345,25 @@ def decrypt():
     while len(buf2 := stdin.read(65536)) != 0:
         if buf:
             stdout.write(decryptor.update(buf))
+            if options.verbose:
+                n_bytes += len(buf)
+                print(f"\rProcessed {n_bytes} bytes.", end="")
         buf = buf2
     if mode["auth_tag"]:
         stdout.write(decryptor.update(buf[:-mode["auth_tag"]]))
-        stdout.write(decryptor.finalize_with_tag(buf[-mode["auth_tag"]:]))
+        if options.verbose:
+            n_bytes += len(buf) - mode["auth_tag"]
+            print(f"\rProcessed {n_bytes} bytes.", end="")
+        try:
+            buf = decryptor.finalize_with_tag(buf[-mode["auth_tag"]:])
+            stdout.write(buf)
+            if options.verbose:
+                n_bytes += mode["auth_tag"]
+                print(f"\rProcessed {n_bytes} bytes.", end="")
+                print(f"\nProcessed an authentication token of length {mode['auth_tag']}.")
+        except InvalidTag:
+            print("\nThe authentication token could not be verified. Most likely the data is corrupt.", file=sys.stderr)
+            exit(1)
     else:
         stdout.write(decryptor.update(buf))
         stdout.write(decryptor.finalize())
